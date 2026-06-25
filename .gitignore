@@ -1,0 +1,18 @@
+# Per-machine user settings (data/output folders) -- not shared
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# One-off investigation scripts / dumps, not part of deployment
+archive/
+
+# Windows build outputs (deploy/)
+deploy/build/
+deploy/Output/
+
+# Generated output / backups / logs
+ui_check_logs/
+*.bak-*
