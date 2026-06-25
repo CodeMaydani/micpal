@@ -90,7 +90,7 @@ if os.path.exists(srgl_path):
     existing_templates = engine.list_existing_templates(srgl_path)
 else:
     st.warning(
-        f"{SRGL_FILENAME} not found at {srgl_path} -- insertion (Step 4) will not be possible until it exists."
+        f"{SRGL_FILENAME} not found at {srgl_path} -- insertion (Step 3) will not be possible until it exists."
     )
 
 company = st.selectbox("Company number", companies, key="company_select")
@@ -266,13 +266,21 @@ else:
                 srgl_path, template_name, st.session_state.template_text, company
             )
         except PermissionError:
-            st.error(
-                "**Permission denied** — the app cannot write to the data folder.\n\n"
-                "Restart the app with:\n"
-                "```\n"
-                "sudo ~/workspace/micpal-app/.venv/bin/streamlit run app.py\n"
-                "```"
+            msg = (
+                f"**Permission denied** — cannot write to `{srgl_path}`.\n\n"
+                "You need write access to the data folder for insertion to work."
             )
+            if os.name == "nt":
+                msg += (
+                    " If it's a shared drive, ask whoever manages it to grant "
+                    "you write permission."
+                )
+            else:
+                msg += (
+                    "\n\nOn this dev machine the share usually needs elevation — "
+                    "restart with:\n```\nsudo .venv/bin/streamlit run app.py\n```"
+                )
+            st.error(msg)
         except Exception as e:
             st.error(f"Insertion failed — file NOT modified: {e}")
         else:
