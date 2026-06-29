@@ -6,8 +6,19 @@ now built on the shared engine module that app.py (Streamlit UI) also uses.
 Usage:
     python3 gen_company.py [company] [data_dir] [out_dir] [year] [month] [options]
 
+The [company] positional accepts:
+    004                 a single company (unchanged behavior)
+    004,083,176         several companies at once (comma-separated)
+and the --all option runs every company found in the data folder
+(every Q8MIFL26.* / Q8OVDM26.* pair), ignoring the [company] positional.
+
 Positional arguments are optional; defaults match the original script.
+When more than one company runs, each is isolated -- a failure on one is
+reported and the rest still run -- and a summary is printed at the end.
+
 Options:
+    --all                    Run every discovered company in the data
+                             folder (overrides the [company] positional).
     --carry-forward          Pre-fill each employee row with last month's
                              qty/price values, read from the CURRENT
                              Q8OVDM26.[company] (which holds the previous
@@ -17,6 +28,7 @@ Options:
     --no-carry N[,N...]      EXTRA component numbers to exclude from carry-
                              forward, on top of the auto-detected leave
                              default (vacation/sick/holiday/maternity).
+                             Applies to every company in a batch run.
     --carry-all              Carry forward everything, ignoring even the
                              leave default (overrides --no-carry).
 
@@ -134,6 +146,7 @@ def _parse_args(argv):
     carry_forward = False
     carry_all = False
     no_carry_extra = []
+    all_companies = False
 
     i = 0
     while i < len(argv):
@@ -143,6 +156,8 @@ def _parse_args(argv):
         elif a == "--carry-all":
             carry_all = True
             carry_forward = True
+        elif a in ("--all", "--all-companies"):
+            all_companies = True
         elif a == "--no-carry":
             i += 1
             if i < len(argv):
@@ -157,28 +172,116 @@ def _parse_args(argv):
             positionals.append(a)
         i += 1
 
-    return positionals, carry_forward, carry_all, no_carry_extra
+    return positionals, carry_forward, carry_all, no_carry_extra, all_companies
+
+
+def run_batch(
+    companies,
+    data_dir,
+    out_dir,
+    year,
+    month,
+    carry_forward=False,
+    no_carry_extra=None,
+    carry_all=False,
+):
+    """
+    Run main() for each company in `companies`, isolating failures so one
+    bad company doesn't abort the rest. Prints a per-company line and a
+    final summary. Returns a list of result dicts:
+        {"company", "ok", "template_path"/"excel_path" or "error"}
+    """
+    results = []
+    total = len(companies)
+    for idx, company in enumerate(companies, 1):
+        print(f"\n[{idx}/{total}] " + "=" * 50)
+        try:
+            template_path, excel_path = main(
+                company,
+                data_dir,
+                out_dir,
+                year,
+                month,
+                carry_forward=carry_forward,
+                no_carry_extra=no_carry_extra,
+                carry_all=carry_all,
+            )
+            results.append(
+                {
+                    "company": company,
+                    "ok": True,
+                    "template_path": template_path,
+                    "excel_path": excel_path,
+                }
+            )
+        except Exception as e:
+            # Isolate: report and continue with the remaining companies.
+            print(f"  ERROR on company {company}: {e}")
+            results.append({"company": company, "ok": False, "error": str(e)})
+
+    ok = [r for r in results if r["ok"]]
+    failed = [r for r in results if not r["ok"]]
+    print("\n" + "=" * 60)
+    print(f"Batch complete: {len(ok)}/{total} succeeded.")
+    if failed:
+        print(f"  {len(failed)} failed:")
+        for r in failed:
+            print(f"    - {r['company']}: {r['error']}")
+    return results
 
 
 if __name__ == "__main__":
     today = datetime.date.today()
     cfg = config.load()
 
-    positionals, carry_forward, carry_all, no_carry_extra = _parse_args(sys.argv[1:])
+    (
+        positionals,
+        carry_forward,
+        carry_all,
+        no_carry_extra,
+        all_companies,
+    ) = _parse_args(sys.argv[1:])
 
-    COMPANY = positionals[0] if len(positionals) > 0 else "083"
     DATA_DIR = positionals[1] if len(positionals) > 1 else cfg["data_dir"]
     OUT_DIR = positionals[2] if len(positionals) > 2 else cfg["out_dir"]
     YEAR = int(positionals[3]) if len(positionals) > 3 else today.year
     MONTH = int(positionals[4]) if len(positionals) > 4 else today.month
 
-    main(
-        COMPANY,
-        DATA_DIR,
-        OUT_DIR,
-        YEAR,
-        MONTH,
-        carry_forward=carry_forward,
-        no_carry_extra=no_carry_extra,
-        carry_all=carry_all,
-    )
+    # Resolve which companies to run:
+    #   --all                 -> every discovered company in the data folder
+    #   "004,083,176"         -> that explicit list (comma-separated)
+    #   "004"                 -> single company (unchanged behavior)
+    #   (nothing)             -> the original default, "083"
+    if all_companies:
+        companies = engine.discover_companies(DATA_DIR)
+        if not companies:
+            sys.exit(
+                f"No companies found in {DATA_DIR} (need Q8MIFL26.* + Q8OVDM26.* pairs)."
+            )
+        print(f"--all: found {len(companies)} companies: {', '.join(companies)}")
+    else:
+        company_arg = positionals[0] if len(positionals) > 0 else "083"
+        companies = [c.strip() for c in company_arg.split(",") if c.strip()]
+
+    if len(companies) == 1:
+        main(
+            companies[0],
+            DATA_DIR,
+            OUT_DIR,
+            YEAR,
+            MONTH,
+            carry_forward=carry_forward,
+            no_carry_extra=no_carry_extra,
+            carry_all=carry_all,
+        )
+    else:
+        run_batch(
+            companies,
+            DATA_DIR,
+            OUT_DIR,
+            YEAR,
+            MONTH,
+            carry_forward=carry_forward,
+            no_carry_extra=no_carry_extra,
+            carry_all=carry_all,
+        )

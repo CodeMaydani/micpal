@@ -62,6 +62,11 @@ _defaults = {
     "carry_count": 0,
     "inserted": False,
     "backup_path": None,
+    # batch mode: persist generated templates across reruns so the insert
+    # step (a separate button click) can act on them.
+    "batch_results": None,
+    "batch_inserted": False,
+    "batch_insert_summary": None,
 }
 for k, v in _defaults.items():
     st.session_state.setdefault(k, v)
@@ -103,6 +108,290 @@ if not companies:
         "No companies found (need matching Q8MIFL26.* and Q8OVDM26.* pairs in the data folder)."
     )
     st.stop()
+
+# ---------------------------------------------------------------------------
+# Mode: one company (full wizard incl. insert) vs. batch generate (many at
+# once, generate-only). Insert into Q8SRGL26.000 stays single-company on
+# purpose -- it's the one destructive, per-template, confirmed step, and is
+# not safe to loop unattended.
+# ---------------------------------------------------------------------------
+SINGLE_MODE = "חברה אחת (כולל הוספה לקובץ התבניות)"
+BATCH_MODE = "מספר חברות יחד (יצירת קבצים בלבד)"
+run_mode = st.radio(
+    "מצב הרצה",
+    [SINGLE_MODE, BATCH_MODE],
+    index=0,
+    horizontal=True,
+    help=(
+        "חברה אחת: התהליך המלא כולל סקירה והוספה ל-Q8SRGL26.000. "
+        "מספר חברות: יצירת ה-Excel וה-txt לכמה חברות בבת אחת (ללא הוספה לקובץ "
+        "התבניות -- שלב ההוספה נשאר פר-חברה מטעמי בטיחות)."
+    ),
+)
+
+# ===========================================================================
+# BATCH MODE -- generate files for several companies at once, then OPTIONALLY
+# insert their templates into Q8SRGL26.000 in one confirmed step (mirrors the
+# single-company Step 3, looped with per-company backup + isolation).
+# Rendered instead of the single-company wizard; st.stop() at the end keeps
+# the wizard below from also running.
+# ===========================================================================
+if run_mode == BATCH_MODE:
+    st.header("Batch — generate & insert for multiple companies")
+
+    selected = st.multiselect(
+        "בחר חברות",
+        companies,
+        default=companies,
+        help="כל החברות נבחרות כברירת מחדל; אפשר לצמצם.",
+    )
+
+    today = datetime.date.today()
+    bc1, bc2 = st.columns(2)
+    with bc1:
+        b_year = st.number_input(
+            "שנת מס (year)",
+            min_value=2000,
+            max_value=2100,
+            value=today.year,
+            step=1,
+            key="batch_year",
+        )
+    with bc2:
+        b_month = st.number_input(
+            "חודש דיווח (month)",
+            min_value=1,
+            max_value=12,
+            value=today.month,
+            step=1,
+            key="batch_month",
+        )
+
+    b_carry = st.checkbox(
+        "מלא אוטומטית ערכי כמות/מחיר מהחודש הקודם (carry-forward)",
+        value=False,
+        key="batch_carry",
+        help=(
+            "בהרצת אצווה לא מוצג בורר רכיבים פר-חברה; רכיבי חופשה/מחלה/חג/לידה "
+            "מזוהים אוטומטית לפי שם ואינם מועברים. סמן 'העבר הכל' כדי להעביר גם אותם."
+        ),
+    )
+    b_carry_all = False
+    if b_carry:
+        b_carry_all = st.checkbox(
+            "העבר הכל (כולל חופשה/מחלה)", value=False, key="batch_carry_all"
+        )
+
+    if not selected:
+        st.info("בחר לפחות חברה אחת.")
+    elif st.button(f"Generate {len(selected)} companies", type="primary"):
+        os.makedirs(out_dir, exist_ok=True)
+        rows = []
+        progress = st.progress(0.0)
+        for idx, comp in enumerate(selected, 1):
+            mifl_path = os.path.join(data_dir, f"Q8MIFL26.{comp}")
+            ovdm_path = os.path.join(data_dir, f"Q8OVDM26.{comp}")
+            tname = f"תבנית משכורות אוטומציה {comp}"
+            try:
+                comps, _skip = engine.extract_components(mifl_path)
+                emps, _inv = engine.extract_employees(ovdm_path)
+                ttext, cmap, scols = engine.build_template(tname, comps)
+
+                prior = None
+                no_carry = set()
+                if b_carry:
+                    prior = engine.read_prior_month(ovdm_path)
+                    no_carry = (
+                        set()
+                        if b_carry_all
+                        else engine.default_no_carry_components(comps)
+                    )
+
+                xpath = os.path.join(out_dir, f"template_{comp}.xlsx")
+                rep = engine.build_excel(
+                    comp,
+                    comps,
+                    cmap,
+                    scols,
+                    emps,
+                    xpath,
+                    int(b_year),
+                    int(b_month),
+                    prior_month=prior,
+                    no_carry=no_carry,
+                )
+                rows.append(
+                    {
+                        "company": comp,
+                        "template_name": tname,
+                        # keep the template block IN MEMORY for the insert
+                        # step -- no loose .txt is written to the output folder
+                        "template_text": ttext,
+                        "ok": True,
+                        "employees": len(emps),
+                        "components": len(comps),
+                        "carried": rep["carried"],
+                        "new_hires": len(rep["new_hires"]),
+                        "xlsx_path": xpath,
+                        "error": None,
+                    }
+                )
+            except Exception as e:
+                # Isolate per company -- one failure must not abort the batch.
+                rows.append(
+                    {
+                        "company": comp,
+                        "template_name": tname,
+                        "template_text": None,
+                        "ok": False,
+                        "employees": 0,
+                        "components": 0,
+                        "carried": 0,
+                        "new_hires": 0,
+                        "xlsx_path": None,
+                        "error": str(e),
+                    }
+                )
+            progress.progress(idx / len(selected))
+
+        st.session_state.batch_results = rows
+        st.session_state.batch_inserted = False
+        st.session_state.batch_insert_summary = None
+
+    # ---- persistent results + insert step (survives reruns) --------------
+    results = st.session_state.batch_results
+    if results:
+        ok = [r for r in results if r["ok"]]
+        st.success(f"נוצרו {len(ok)} מתוך {len(results)} חברות (קובצי Excel).")
+        st.dataframe(
+            [
+                {
+                    "חברה": r["company"],
+                    "סטטוס": "✓" if r["ok"] else f"✗ {r['error']}",
+                    "עובדים": r["employees"],
+                    "רכיבים": r["components"],
+                    "הועברו": r["carried"],
+                    "עובדים חדשים": r["new_hires"],
+                }
+                for r in results
+            ],
+            use_container_width=True,
+        )
+
+        # ZIP of the generated EXCEL files (the deliverable to fill & import).
+        import io
+        import zipfile
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for r in ok:
+                if r["xlsx_path"]:
+                    zf.write(r["xlsx_path"], arcname=os.path.basename(r["xlsx_path"]))
+        buf.seek(0)
+        st.download_button(
+            f"⬇ Download all Excel files ({len(ok)}) as ZIP",
+            buf,
+            file_name=f"templates_batch_{int(b_year)}_{int(b_month):02d}.zip",
+            mime="application/zip",
+        )
+        if b_carry:
+            st.caption(
+                "תזכורת: carry-forward קורא את הערכים מקובץ Q8OVDM26 הנוכחי, "
+                "שמכיל את נתוני החודש הקודם עד לייבוא החדש. יש להפיק לפני הייבוא."
+            )
+
+        # ---- batch template insert into Q8SRGL26.000 --------------------
+        st.divider()
+        st.subheader("עדכון התבניות בקובץ Q8SRGL26.000")
+        insertable = [r for r in ok if r["template_text"]]
+        if not os.path.exists(srgl_path):
+            st.warning(
+                f"{SRGL_FILENAME} not found at {srgl_path} — cannot insert "
+                f"templates until it exists."
+            )
+        elif not insertable:
+            st.info("אין תבניות להוספה.")
+        else:
+            st.warning(
+                f"This will modify `{srgl_path}` for **{len(insertable)} "
+                f"companies**.\n\nEach company's template is inserted "
+                f"separately, and a backup of {SRGL_FILENAME} is created "
+                f"before each insert (existing same-named templates are "
+                f"replaced)."
+            )
+            confirm_batch = st.checkbox(
+                "אני מאשר עדכון התבניות לכל החברות שנוצרו.",
+                key="batch_insert_confirm",
+            )
+            if st.button(
+                f"Insert {len(insertable)} templates",
+                disabled=not confirm_batch,
+                type="primary",
+            ):
+                summary = []
+                prog = st.progress(0.0)
+                for i, r in enumerate(insertable, 1):
+                    try:
+                        res = engine.regenerate_and_insert_template(
+                            srgl_path,
+                            r["template_name"],
+                            r["template_text"],
+                            r["company"],
+                        )
+                        summary.append(
+                            {
+                                "company": r["company"],
+                                "ok": True,
+                                "backup": res.get("insert_backup"),
+                                "error": None,
+                            }
+                        )
+                    except PermissionError:
+                        summary.append(
+                            {
+                                "company": r["company"],
+                                "ok": False,
+                                "backup": None,
+                                "error": "Permission denied (write access to data folder needed)",
+                            }
+                        )
+                    except Exception as e:
+                        # Isolate: a bad company must not abort remaining inserts.
+                        summary.append(
+                            {
+                                "company": r["company"],
+                                "ok": False,
+                                "backup": None,
+                                "error": str(e),
+                            }
+                        )
+                    prog.progress(i / len(insertable))
+                st.session_state.batch_inserted = True
+                st.session_state.batch_insert_summary = summary
+
+        summary = st.session_state.batch_insert_summary
+        if summary:
+            ins_ok = [s for s in summary if s["ok"]]
+            if len(ins_ok) == len(summary):
+                st.success(f"הוכנסו {len(ins_ok)} תבניות אל {SRGL_FILENAME}.")
+            else:
+                st.error(
+                    f"הוכנסו {len(ins_ok)} מתוך {len(summary)} — חלק נכשלו (ראה טבלה)."
+                )
+            st.dataframe(
+                [
+                    {
+                        "חברה": s["company"],
+                        "סטטוס": "✓" if s["ok"] else f"✗ {s['error']}",
+                        "גיבוי": os.path.basename(s["backup"]) if s["backup"] else "",
+                    }
+                    for s in summary
+                ],
+                use_container_width=True,
+            )
+            st.caption("לשחזור ידני: העתק את קובץ הגיבוי על Q8SRGL26.000.")
+
+    st.stop()  # batch mode handled; do not fall through to the single wizard
 
 existing_templates = []
 if os.path.exists(srgl_path):
