@@ -194,13 +194,16 @@ if run_mode == BATCH_MODE:
             tname = f"תבנית משכורות אוטומציה {comp}"
             try:
                 comps, _skip = engine.extract_components(mifl_path)
+                deds = engine.extract_deductions(mifl_path)
                 emps, _inv = engine.extract_employees(ovdm_path)
-                ttext, cmap, scols = engine.build_template(tname, comps)
+                ttext, cmap, scols, dmap = engine.build_template(tname, comps, deds)
 
                 prior = None
+                prior_ded = None
                 no_carry = set()
                 if b_carry:
                     prior = engine.read_prior_month(ovdm_path)
+                    prior_ded = engine.read_prior_month_deductions(ovdm_path)
                     no_carry = (
                         set()
                         if b_carry_all
@@ -219,6 +222,8 @@ if run_mode == BATCH_MODE:
                     int(b_month),
                     prior_month=prior,
                     no_carry=no_carry,
+                    ded_map=dmap,
+                    prior_deductions=prior_ded,
                 )
                 rows.append(
                     {
@@ -563,6 +568,7 @@ if st.button("Extract & generate", type="primary"):
     ovdm_path = os.path.join(data_dir, f"Q8OVDM26.{company}")
     try:
         components, skipped = engine.extract_components(mifl_path)
+        deductions = engine.extract_deductions(mifl_path)
         active_emps, inactive_emps, _inv = load_employees_with_status(
             ovdm_path, os.path.getmtime(ovdm_path)
         )
@@ -591,19 +597,22 @@ if st.button("Extract & generate", type="primary"):
         st.session_state.inserted = False
 
         os.makedirs(out_dir, exist_ok=True)
-        template_text, col_map, stats_cols = engine.build_template(
-            template_name, components
+        template_text, col_map, stats_cols, ded_map = engine.build_template(
+            template_name, components, deductions
         )
 
         # carry-forward: read previous month's values from the same Q8OVDM26
         # (it holds last month's data until the new sheet is imported).
         prior_month = None
+        prior_deductions = None
         if carry_forward:
             try:
                 prior_month = engine.read_prior_month(ovdm_path)
+                prior_deductions = engine.read_prior_month_deductions(ovdm_path)
             except Exception as e:
                 st.error(f"Could not read previous month's values: {e}")
                 prior_month = None
+                prior_deductions = None
 
         excel_path = os.path.join(out_dir, f"template_{company}.xlsx")
         try:
@@ -618,6 +627,8 @@ if st.button("Extract & generate", type="primary"):
                 int(month),
                 prior_month=prior_month,
                 no_carry=no_carry_numbers,
+                ded_map=ded_map,
+                prior_deductions=prior_deductions,
             )
         except Exception as e:
             st.error(f"Excel generation failed: {e}")

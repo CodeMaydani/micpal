@@ -68,6 +68,10 @@ def main(
     if skipped:
         print(f"    ({skipped} candidate component records filtered out)")
 
+    deductions = engine.extract_deductions(mifl_path)
+    if deductions:
+        print(f"  Found {len(deductions)} deduction components (רכיבי ניכוי)")
+
     print("  Extracting employees...")
     employees, invalid = engine.extract_employees(ovdm_path)
     print(f"  Found {len(employees)} employees")
@@ -75,8 +79,8 @@ def main(
         print(f"    ({invalid} employee blocks had an invalid תעודת זהות)")
 
     print("  Building template...")
-    template_text, col_map, stats_cols = engine.build_template(
-        template_name, components
+    template_text, col_map, stats_cols, ded_map = engine.build_template(
+        template_name, components, deductions
     )
 
     template_path = f"{out_dir}/template_{company}.txt"
@@ -86,10 +90,12 @@ def main(
 
     # --- carry-forward: read previous month's values from the same Q8OVDM26 ---
     prior_month = None
+    prior_deductions = None
     no_carry = set()
     if carry_forward:
         print("  Reading previous month's values for carry-forward...")
         prior_month = engine.read_prior_month(ovdm_path)
+        prior_deductions = engine.read_prior_month_deductions(ovdm_path)
         if carry_all:
             no_carry = set()
         else:
@@ -113,6 +119,8 @@ def main(
         month,
         prior_month=prior_month,
         no_carry=no_carry,
+        ded_map=ded_map,
+        prior_deductions=prior_deductions,
     )
     print(f"  Excel saved:    {result['out_path']}")
     if carry_forward:

@@ -173,6 +173,58 @@ _ALLOWED_PUNCT = set(" .,'\"%-~$()/+")
 _MAX_NOISE_FRACTION = 0.15
 
 
+# ---------------------------------------------------------------------------
+# Deduction components (רכיבי ניכוי רשות) -- a SEPARATE family from salary
+# ---------------------------------------------------------------------------
+# These live in their own definition table in Q8MIFL26, distinct from the
+# salary components (which start at 0x4e2e). The deduction table is a packed
+# array of fixed 20-byte records starting at DEDUCTION_DEF_START:
+#     bytes [0:10]   name, null-padded ISO-8859-8
+#     bytes [10:14]  קוד מה"כ (4-char code, e.g. עאממ / מאהמ / מאשמ)
+#     bytes [14:20]  padding (zero)
+# The deduction NUMBER is simply the zero-based index in this table (verified
+# against the live מיכפל dropdown: 0=מפרעה, 1=החזר הלואה, 2=חנות המפעל, ...).
+# Terminated by the first record whose name is the '..........' placeholder
+# (i.e. not a real Hebrew name).
+DEDUCTION_DEF_START = 0x3F9D
+DEDUCTION_DEF_SIZE = 20
+MAX_DEDUCTIONS = 100  # generous guard; real tables are small (single digits)
+
+
+def extract_deductions(path):
+    """
+    Parse the deduction-definition table from Q8MIFL26.[company].
+
+    Returns a list of (deduction_number, name, kod_mahk) tuples, where
+    deduction_number is the zero-based index (matches the מיכפל dropdown and
+    the value stored per-employee; see read_prior_month's deduction region).
+    kod_mahk is the 4-char code string. The list is in table order and stops
+    at the first non-real-name record (the '..........' placeholder).
+    """
+    data = open(path, "rb").read()
+    results = []
+    for i in range(MAX_DEDUCTIONS):
+        off = DEDUCTION_DEF_START + i * DEDUCTION_DEF_SIZE
+        if off + DEDUCTION_DEF_SIZE > len(data):
+            break
+        raw_name = (
+            data[off : off + 10]
+            .rstrip(b"\x00")
+            .decode("iso-8859-8", errors="replace")
+            .strip()
+        )
+        name = sanitize_text(raw_name)
+        if not name or "\ufffd" in name or not looks_like_real_component_name(name):
+            break  # placeholder / end of table
+        kod_mahk = (
+            data[off + 10 : off + 14]
+            .decode("iso-8859-8", errors="replace")
+            .strip("\x00")
+        )
+        results.append((i, name, kod_mahk))
+    return results
+
+
 def looks_like_real_component_name(name):
     """
     Content-based filter distinguishing real component names from garbage
@@ -245,6 +297,86 @@ SLOT_COMP_NUM_OFF = 7  # within slot: component number (real מיכפל #), 1 by
 SLOT_QTY_OFF = 14  # within slot: quantity x100, int32 LE
 SLOT_PRICE_OFF = 18  # within slot: price    x100, int32 LE
 _SLOT_WALK_GUARD = 260  # never walk past a plausible slot count (252 + margin)
+
+# Deduction values per employee (רכיבי ניכוי רשות). Stored in a SEPARATE,
+# tighter table than salary: packed 5-byte records in a "mirror" region at a
+# fixed offset, each [amount int32 LE x100][trailing byte], preceded by a 0x01
+# flag. Deductions are PRICE-ONLY (no quantity) plus a month field (in the
+# primary copy near offset 6252). The trailing byte holds the NEXT record's
+# (deduction_number + 1) -- the same "next record's number" quirk as the salary
+# table -- so the correct deduction number is the PREVIOUS record's trailing
+# byte minus 1, with the first record = deduction 0. Validated against company
+# 004 across two gap tests (indices 0,2,5 -> trailing 3,6,0; and 0,1,2 ->
+# trailing 2,3,0). Reading the mirror region (clean 5-byte records) here; the
+# month lives in the primary copy and is not needed for carry-forward.
+DEDUCTION_MIRROR_OFFSET = 70631  # first deduction record within EMPLOYEE_BLOCK
+DEDUCTION_REC_SIZE = 5
+DEDUCTION_AMOUNT_OFF = 0  # within record: amount x100, int32 LE
+DEDUCTION_TRAILING_OFF = 4  # within record: NEXT record's (number + 1)
+_DEDUCTION_WALK_GUARD = 110
+
+
+def read_prior_month_deductions(path):
+    """
+    Read prior-month per-employee deduction amounts from Q8OVDM26.[company].
+
+    Returns { tz_str : { deduction_number (int) : amount (float) } }.
+    deduction_number is the zero-based index matching extract_deductions()
+    and the מיכפל dropdown. amount is whole-shekel float (x100 un-scaled).
+    Employees with no deductions map to an empty dict (same convention as
+    read_prior_month). Filtering mirrors read_prior_month exactly so keys
+    line up with sheet rows.
+    """
+    data = open(path, "rb").read()
+    total_blocks = len(data) // EMPLOYEE_BLOCK
+    out = {}
+    for b in range(total_blocks):
+        block = data[b * EMPLOYEE_BLOCK : (b + 1) * EMPLOYEE_BLOCK]
+        status = block[KOD_HAFSAKA_OFFSET]
+        if status not in (STATUS_ACTIVE, STATUS_INACTIVE):
+            continue
+        end = block.index(b"\x00", 9)
+        last_name = sanitize_text(
+            block[9:end].decode("iso-8859-8", errors="replace").strip()
+        )
+        end2 = block.index(b"\x00", 29)
+        first_name = sanitize_text(
+            block[29:end2].decode("iso-8859-8", errors="replace").strip()
+        )
+        full_name = f"{first_name} {last_name}".strip()
+        if not full_name or "\ufffd" in full_name:
+            continue
+        tz_raw = struct.unpack_from("<I", block, 59)[0]
+        if tz_raw == 0 or not valid_israeli_id(tz_raw):
+            continue
+        out[str(tz_raw).zfill(9)] = _read_block_deductions(block)
+    return out
+
+
+def _read_block_deductions(block):
+    """
+    Parse one employee's deduction mirror region into
+    {deduction_number: amount}. Uses the previous-record's trailing byte to
+    recover each record's deduction number (the trailing byte holds the NEXT
+    record's number+1; the first record is deduction 0).
+    """
+    out = {}
+    prev_trailing = None
+    for i in range(_DEDUCTION_WALK_GUARD):
+        off = DEDUCTION_MIRROR_OFFSET + i * DEDUCTION_REC_SIZE
+        if off + DEDUCTION_REC_SIZE > len(block):
+            break
+        amount_raw = struct.unpack_from("<i", block, off + DEDUCTION_AMOUNT_OFF)[0]
+        trailing = block[off + DEDUCTION_TRAILING_OFF]
+        if amount_raw == 0 and trailing == 0:
+            break  # terminator
+        if i == 0 or prev_trailing is None:
+            ded_number = 0
+        else:
+            ded_number = prev_trailing - 1
+        out[ded_number] = amount_raw / 100.0
+        prev_trailing = trailing
+    return out
 
 
 def read_prior_month(path):
@@ -463,22 +595,27 @@ def _read_employee_records(path):
 # ---------------------------------------------------------------------------
 
 
-def build_template(template_name, components):
+def build_template(template_name, components, deductions=None):
     """
     Build the @@QD@@ text block for insertion into Q8SRGL26.000.
 
-    Returns (template_text, col_map, stats_cols).
+    Returns (template_text, col_map, stats_cols, ded_map).
       col_map    -- list of (actual_code, name, col_כמות, col_מחיר)
       stats_cols -- list of (field_code, label, col_index)
+      ded_map    -- list of (deduction_number, name, col_amount, col_month)
+                    for each deduction (רכיבי ניכוי רשות); empty if none.
 
-    Also attaches a `.real_to_cols` attribute to the returned col_map list
-    (a dict {real_component_number: (col_כמות, col_מחיר)}) used by carry-
-    forward to place prior-month values. The real component number is the
-    value that matches read_prior_month()'s slot[7] keys -- it is captured
-    directly from the layout iteration here rather than re-derived by
-    arithmetic downstream, because the @D `actual` code is NOT the real
-    number (they differ by the משכורת/רכב boundary and by per-company gaps).
+    Deductions are a separate component family (see extract_deductions). In
+    the @D block each deduction is emitted as:
+        @D<ded_number+1> -2 -2 1     (section separator; field code -2)
+        @D<ded_number+1> 25 <col> 1  (amount  -- field code 25, סכום)
+        @D<ded_number+1> 26 <col+1> 1 (month  -- field code 26)
+    matching the encoding מיכפל itself produced for company 004's מפרעה
+    example (@D1 25 .. / @D1 26 ..; the +1 because the @D line uses
+    deduction_number + 1, מפרעה=0 -> @D1). Deduction columns are placed
+    AFTER the last salary component and BEFORE the stats columns.
     """
+    deductions = deductions or []
     lines = []
     lines.append(f"@N{template_name}")
     lines.append("@V90072")
@@ -515,6 +652,19 @@ def build_template(template_name, components):
         lines.append(f"@D{actual} 8 3 1")
         col += 2
 
+    # --- deductions (רכיבי ניכוי רשות): amount + month, after salary,
+    #     before the stats block. Field codes 25=amount, 26=month; the @D
+    #     line uses deduction_number + 1 (מפרעה=0 -> @D1). ------------------
+    ded_map = []
+    for ded_number, name, _kod in deductions:
+        col_amount, col_month = col, col + 1
+        ded_map.append((ded_number, name, col_amount, col_month))
+        d = ded_number + 1
+        lines.append(f"@D{d} -2 -2 1")
+        lines.append(f"@D{d} 25 {col_amount} 1")
+        lines.append(f"@D{d} 26 {col_month} 1")
+        col += 2
+
     stats = [
         (10, "ימי עבודה משולמים"),
         (14, "ימי עבודה בפועל"),
@@ -530,7 +680,7 @@ def build_template(template_name, components):
         stats_cols.append((field, label, col))
         col += 1
 
-    return "\n".join(lines) + "\n", col_map, stats_cols
+    return "\n".join(lines) + "\n", col_map, stats_cols, ded_map
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +699,8 @@ def build_excel(
     month,
     prior_month: "dict | None" = None,
     no_carry: "set | None" = None,
+    ded_map=None,
+    prior_deductions: "dict | None" = None,
 ):
     """
     Generate the .xlsx import template.
@@ -562,10 +714,23 @@ def build_excel(
                      (qty, price)}}. When given, each employee's row is
                      pre-filled with last month's qty/price for every
                      component that maps to a column. Components are joined
-                     by REAL מיכפל number (= col_map `actual` + 1, and the
-                     fixed משכורת block = component 1).
+                     by REAL מיכפל number (= col_map `actual`, and the fixed
+                     משכורת block = component 1).
       no_carry    -- iterable of REAL מיכפל component numbers NOT to carry
                      forward (e.g. vacation/sick). Defaults to none excluded.
+
+    Deductions (רכיבי ניכוי רשות, optional):
+      ded_map          -- list of (deduction_number, name, col_amount,
+                          col_month) from build_template(). Adds an amount
+                          column and a month column per deduction (headers
+                          = deduction name + " סכום" / " חודש").
+      prior_deductions -- dict from read_prior_month_deductions():
+                          {tz: {deduction_number: amount}}. When given,
+                          each employee's deduction AMOUNT cell is pre-filled
+                          (carry-forward). Month cells are left blank for the
+                          operator to fill. no_carry is NOT applied to
+                          deductions (leave-type exclusions are a salary
+                          concept).
 
     New-hire highlighting: when prior_month is given, any employee whose תז
     is NOT a key in prior_month had no prior-month record (a new hire). Their
@@ -577,9 +742,11 @@ def build_excel(
     Returns a dict:
         {"out_path": str, "new_hires": [(tz, name), ...],
          "no_activity": [(tz, name), ...], "carried": int}
-    where `carried` is the total number of (employee, component) cells filled.
+    where `carried` is the total number of (employee, component) cells filled
+    (salary + deductions).
     """
     no_carry = set(no_carry or ())
+    ded_map = ded_map or []
     wb = openpyxl.Workbook()
     ws = wb.active
     assert ws is not None  # a fresh Workbook always has an active sheet;
@@ -593,6 +760,7 @@ def build_excel(
     header_fill = PatternFill("solid", start_color="D9E1F2")
     comp_fill = PatternFill("solid", start_color="E2EFDA")
     stats_fill = PatternFill("solid", start_color="FFF2CC")
+    ded_fill = PatternFill("solid", start_color="FBE2D5")  # deduction columns
     rechiv1_fill = PatternFill("solid", start_color="FCE4D6")
     emp_fill = PatternFill("solid", start_color="F2F2F2")
     newhire_fill = PatternFill("solid", start_color="FFFF00")  # new-hire תז/שם marker
@@ -649,6 +817,15 @@ def build_excel(
         style(safe_set(ws.cell(4, col_k), f"{name}\nכמות"), font=bold, fill=comp_fill)
         style(safe_set(ws.cell(4, col_m), f"{name}\nמחיר"), font=bold, fill=comp_fill)
 
+    # deduction headers: amount + month per deduction (after salary, before stats)
+    for ded_number, name, col_amount, col_month in ded_map:
+        style(
+            safe_set(ws.cell(4, col_amount), f"{name}\nסכום"), font=bold, fill=ded_fill
+        )
+        style(
+            safe_set(ws.cell(4, col_month), f"{name}\nחודש"), font=bold, fill=ded_fill
+        )
+
     for field, label, col_idx in stats_cols:
         style(safe_set(ws.cell(4, col_idx), label), font=bold, fill=stats_fill)
 
@@ -666,39 +843,51 @@ def build_excel(
     for actual, name, col_k, col_m in col_map:
         comp_to_cols[actual] = (col_k, col_m)
 
+    # deduction-number -> amount column (month column left for the operator)
+    ded_to_col = {dn: col_amount for dn, _name, col_amount, _col_month in ded_map}
+
     # --- rows 5+: employees ---------------------------------------------
     new_hires = []
     no_activity = []
     carried = 0
     for row_idx, (tz, full_name) in enumerate(employees, 5):
+        # "new hire" is judged on salary prior_month (the primary signal);
+        # deductions are carried independently below regardless.
         is_new_hire = prior_month is not None and tz not in prior_month
         id_fill = newhire_fill if is_new_hire else emp_fill
 
         style(safe_set(ws.cell(row_idx, 1), tz), fill=id_fill)
         style(safe_set(ws.cell(row_idx, 2), full_name), fill=id_fill, align=left)
 
-        if prior_month is None:
-            continue  # no carry-forward requested
-
-        if is_new_hire:
+        # salary carry-forward
+        if prior_month is not None and not is_new_hire:
+            emp_prior = prior_month[tz]
+            if not emp_prior:
+                no_activity.append((tz, full_name))
+            else:
+                for comp_num, (qty, price) in emp_prior.items():
+                    if comp_num in no_carry:
+                        continue
+                    cols = comp_to_cols.get(comp_num)
+                    if cols is None:
+                        continue  # component has no column in this template
+                    col_k, col_m = cols
+                    style(safe_set(ws.cell(row_idx, col_k), qty), fill=emp_fill)
+                    style(safe_set(ws.cell(row_idx, col_m), price), fill=emp_fill)
+                    carried += 1
+        elif is_new_hire:
             new_hires.append((tz, full_name))
-            continue  # nothing to carry forward
 
-        emp_prior = prior_month[tz]
-        if not emp_prior:
-            no_activity.append((tz, full_name))
-            continue  # existed last month, no lines -- leave row blank
-
-        for comp_num, (qty, price) in emp_prior.items():
-            if comp_num in no_carry:
-                continue
-            cols = comp_to_cols.get(comp_num)
-            if cols is None:
-                continue  # component has no column in this template -- skip
-            col_k, col_m = cols
-            style(safe_set(ws.cell(row_idx, col_k), qty), fill=emp_fill)
-            style(safe_set(ws.cell(row_idx, col_m), price), fill=emp_fill)
-            carried += 1
+        # deduction carry-forward (independent of salary lines; amount only,
+        # month left blank for the operator)
+        if prior_deductions is not None and ded_to_col:
+            emp_ded = prior_deductions.get(tz, {})
+            for ded_num, amount in emp_ded.items():
+                col_amount = ded_to_col.get(ded_num)
+                if col_amount is None:
+                    continue  # deduction has no column in this template
+                style(safe_set(ws.cell(row_idx, col_amount), amount), fill=emp_fill)
+                carried += 1
 
     # --- column widths --------------------------------------------------
     ws.column_dimensions["A"].width = 10
@@ -710,6 +899,9 @@ def build_excel(
     for actual, name, col_k, col_m in col_map:
         ws.column_dimensions[col_letter(col_k)].width = 10
         ws.column_dimensions[col_letter(col_m)].width = 10
+    for ded_number, name, col_amount, col_month in ded_map:
+        ws.column_dimensions[col_letter(col_amount)].width = 11
+        ws.column_dimensions[col_letter(col_month)].width = 8
     for field, label, col_idx in stats_cols:
         ws.column_dimensions[col_letter(col_idx)].width = 13
 
