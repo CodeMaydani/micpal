@@ -14,23 +14,40 @@ now and how*.
 
 ## Stack
 - Python 3.13, venv at `~/workspace/micpal-app/.venv`
-- `pip install -r requirements.txt --break-system-packages` (streamlit,
-  openpyxl)
+- `pip install -r requirements.txt --break-system-packages` — deps are now
+  **pinned** (`streamlit==1.58.0`, `openpyxl==3.1.5`) for reproducible builds.
 - **`sudo` drops the venv.** If a command needs `sudo` (writing to
   `/mnt/Z/Msk8/Q8SRGL26.000` usually does), call the venv interpreter
   explicitly: `sudo ~/workspace/micpal-app/.venv/bin/python3 -c "..."`
   — plain `sudo python3` will fail with `ModuleNotFoundError: openpyxl`.
+  In the Streamlit UI this is why insertion is launched with
+  `sudo ~/workspace/micpal-app/.venv/bin/streamlit run app.py`.
+- **Paths are config-driven, never hardcoded.** `config.py` owns defaults
+  (OS-aware: `/mnt/Z/Msk8` on Linux, `Z:\Msk8` on Windows) and persists
+  user changes to `config.json` next to the app. Read paths via
+  `config.load()`, not literals. `config.json` is git-ignored (per-machine).
 
 ## Files
 - `engine.py` — **the only file with real logic.** Pure library, no
   printing, no hardcoded paths. Both `gen_company.py` and `app.py`
   import from it. Edit logic here, nowhere else.
 - `gen_company.py` — CLI entry point: `main(company, data_dir, out_dir,
-  year, month)`.
-- `app.py` — Streamlit UI wrapper. Feature-completeness vs. its own
-  `README.md`: **not yet verified, treat as TODO.**
-- Data lives at `/mnt/Z/Msk8/` (NOT the מיכפל install folder, which is
-  separate and irrelevant to this pipeline).
+  year, month)`. Defaults for `data_dir`/`out_dir` come from `config.py`.
+  Generates files only — does **not** insert into `Q8SRGL26.000`.
+- `app.py` — Streamlit UI wrapper. **3-step flow** (was 4): (1) select
+  company, (2) extract & generate — merged, one button, (3) insert.
+  Insertion goes through `regenerate_and_insert_template` (replace-safe).
+  Audited against `README.md` and reconciled — no longer a TODO.
+- `config.py` — path defaults + persistence (see Stack).
+- `launch.py` — cross-platform launcher: picks a port, starts Streamlit
+  headless, opens the browser, skips starting a second server if one is up.
+- `deploy/` — **Windows installer build** (Inno Setup wizard + bundled
+  standalone Python). See Deployment section and `deploy/README.md`.
+- `archive/` — one-off reverse-engineering / investigation scripts and
+  dumps, kept for reference, git-ignored. NOT part of deployment. (This
+  is where `diff_ui.py`, `scan_companies.py`, etc. now live.)
+- Data lives at `/mnt/Z/Msk8/` on Linux (`Z:\Msk8` on Windows) — NOT the
+  מיכפל install folder, which is separate and irrelevant to this pipeline.
 - `Q8MIFL26.[company]` — binary, per-company salary components.
 - `Q8OVDM26.[company]` — binary, per-company employee list.
 - `Q8SRGL26.000` — ONE shared file, holds every company's template
@@ -86,24 +103,44 @@ see project-knowledge Section 5 if you need the specifics).
    processed under the old buggy rule. Same pattern each time: check
    current state → `regenerate_and_insert_template` → re-verify exactly
    one block.
-3. **Wire `regenerate_and_insert_template()` into `gen_company.py` and
-   `app.py`**, replacing any direct call to `backup_and_insert()`, so
-   the remove-before-insert safety is automatic, not a manual step a
-   human has to remember.
-4. **Audit `app.py`** against its own `README.md` for feature
-   completeness — not yet checked in this pass.
+3. **Build & test the Windows installer** on a Windows machine — run
+   `deploy/TESTING.md` end to end (build → install → run → stop →
+   uninstall). The build artifacts can't be exercised on the Linux dev
+   box; this is the only remaining validation gap.
+
+**Done (was on this list):** wiring `regenerate_and_insert_template` into
+`app.py` (Step 3 of the UI uses it); auditing `app.py` vs `README.md`
+(reconciled — README rewritten to match the 3-step replace-based flow).
+`gen_company.py` was intentionally left generation-only (it never
+inserts), so no insertion wiring is needed there.
+
+## Deployment (Windows-only)
+Decisions are settled (see `deploy/` and project memory):
+- **Windows-only.** Linux stays the dev environment; no Linux installer.
+- **Install to `Z:\Micpal`** — on the share, user-writable, so `config.json`
+  lives next to the app with no permission tricks.
+- **Data path set on first run** in the sidebar (defaults to `Z:\Msk8`); the
+  installer does not ask for it.
+- **Packaging:** bundle a relocatable python-build-standalone CPython +
+  pip-installed pinned deps + app files, wrapped by an Inno Setup wizard.
+  The build (`deploy/build_windows.ps1` + Inno Setup) **must run on Windows**
+  — Windows wheels can't be reliably pip-installed from Linux.
+- `launch.py` is the single entry point; `run_micpal.vbs` / `stop_micpal.vbs`
+  are the windowless start/stop shortcuts.
+- Full build + test instructions: `deploy/README.md` and `deploy/TESTING.md`.
 
 ## Validation tools available (don't rebuild these)
 - `ui_check.py <company>` — dumps a company's component list in the
   exact format the live מיכפל dropdown uses (`011 - name`), plus a full
   raw-record log to `ui_check_logs/`. Use when checking a new company
-  against the live UI.
-- `diff_ui.py <company> <pasted_ui_text.txt>` — automated diff between
-  a UI copy-paste and the file-derived list. Preferred over eyeballing
-  `ui_check.py` output if you have copy-paste access to the dropdown.
-  (Screenshots, not copy-paste, were used for the validation already
-  done — diff_ui.py wasn't actually exercised on real data yet, ui_check
-  output was visually cross-checked against screenshots instead.)
+  against the live UI. (This one is kept at the repo root.)
+- `archive/diff_ui.py <company> <pasted_ui_text.txt>` — automated diff
+  between a UI copy-paste and the file-derived list. Now lives under
+  `archive/`. Preferred over eyeballing `ui_check.py` output if you have
+  copy-paste access to the dropdown. (Screenshots, not copy-paste, were
+  used for the validation already done — diff_ui.py wasn't actually
+  exercised on real data yet, ui_check output was visually cross-checked
+  against screenshots instead.)
 
 ## Hard constraints / things that will waste your time if ignored
 - The on-disk format of `Q8MIFL26` is NOT MFC `CArchive`-serialized
@@ -114,9 +151,9 @@ see project-knowledge Section 5 if you need the specifics).
   against real bytes first, the way every change in this project has
   been.
 - Don't trust visual/manual diffing of two pasted Hebrew text blocks —
-  RTL rendering makes this error-prone. Use `diff_ui.py` (programmatic)
-  or screenshots cross-checked line-by-line with explicit slot numbers,
-  as already done.
+  RTL rendering makes this error-prone. Use `archive/diff_ui.py`
+  (programmatic) or screenshots cross-checked line-by-line with explicit
+  slot numbers, as already done.
 - Never call `backup_and_insert()` for a company that might already
   have a template in the file. Always go through
   `regenerate_and_insert_template()` instead, or duplicates accumulate

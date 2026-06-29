@@ -12,6 +12,7 @@ Flow: pick company -> extract & preview -> generate (no write) -> insert
 import datetime
 import os
 
+import pandas as pd
 import streamlit as st
 
 import config
@@ -50,12 +51,15 @@ _defaults = {
     "components": None,
     "skipped_components": 0,
     "employees": None,
+    "included_inactive": [],
     "invalid_employees": 0,
     "generated": False,
     "template_text": None,
     "col_map": None,
     "stats_cols": None,
     "excel_path": None,
+    "carry_new_hires": [],
+    "carry_count": 0,
     "inserted": False,
     "backup_path": None,
 }
@@ -67,6 +71,21 @@ def _reset_downstream():
     st.session_state.extracted = False
     st.session_state.generated = False
     st.session_state.inserted = False
+    st.session_state.included_inactive = []
+    st.session_state.carry_new_hires = []
+    st.session_state.carry_count = 0
+
+
+@st.cache_data(show_spinner=False)
+def load_employees_with_status(path, mtime):
+    """
+    Cached wrapper around engine.extract_employees_with_status. `mtime`
+    (file modification time) is part of the cache key so the cache busts
+    automatically when the underlying file changes; it isn't used in the
+    body. Avoids re-reading the (potentially large) Q8OVDM26 file on every
+    Streamlit rerun.
+    """
+    return engine.extract_employees_with_status(path)
 
 
 # ---------------------------------------------------------------------------
@@ -124,18 +143,159 @@ st.divider()
 # ---------------------------------------------------------------------------
 st.header("Step 2 — Extract & generate (no write yet)")
 
+# --- inactive-employee handling -------------------------------------------
+ACTIVE_ONLY = "עובדים פעילים בלבד"
+ALL_INACTIVE = "כל העובדים (כולל לא פעילים)"
+SELECT_INACTIVE = "בחירת עובדים לא פעילים לכלול"
+
+inactive_mode = st.radio(
+    "עובדים לא פעילים (קוד הפסקה 1)",
+    [ACTIVE_ONLY, ALL_INACTIVE, SELECT_INACTIVE],
+    index=0,
+    help=(
+        "כברירת מחדל נכללים רק עובדים פעילים. אפשר לכלול את כל הלא-פעילים, "
+        "או לבחור ידנית אילו לכלול."
+    ),
+)
+
+selected_inactive = []
+if inactive_mode == SELECT_INACTIVE:
+    ovdm_path = os.path.join(data_dir, f"Q8OVDM26.{company}")
+    if not os.path.exists(ovdm_path):
+        st.error(f"Q8OVDM26.{company} not found at {ovdm_path}")
+    else:
+        try:
+            _, inactive_list, _ = load_employees_with_status(
+                ovdm_path, os.path.getmtime(ovdm_path)
+            )
+        except Exception as e:
+            st.error(f"Could not read employees: {e}")
+            inactive_list = []
+        if not inactive_list:
+            st.caption("No inactive employees found for this company.")
+        else:
+            st.caption('סמן בעמודת "כלול" את העובדים הלא-פעילים להוספה לתבנית:')
+            editor_rows = pd.DataFrame(
+                {
+                    "כלול": [False] * len(inactive_list),
+                    "תעודת זהות": [tz for tz, _ in inactive_list],
+                    "שם": [name for _, name in inactive_list],
+                }
+            )
+            edited = st.data_editor(
+                editor_rows,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                disabled=["תעודת זהות", "שם"],
+                column_config={
+                    "כלול": st.column_config.CheckboxColumn(
+                        "כלול", help="סמן כדי לכלול עובד זה בתבנית", default=False
+                    ),
+                    "תעודת זהות": st.column_config.TextColumn("תעודת זהות"),
+                    "שם": st.column_config.TextColumn("שם"),
+                },
+                key=f"inactive_editor_{company}",
+            )
+            # Reconstruct (tz, name) straight from the checked rows so the
+            # selection is robust to any visual re-sorting of the table.
+            selected_inactive = [
+                (row["תעודת זהות"], row["שם"])
+                for _, row in edited.iterrows()
+                if row["כלול"]
+            ]
+            st.caption(f"נבחרו {len(selected_inactive)} מתוך {len(inactive_list)}.")
+
+# --- carry-forward (prior-month values) -----------------------------------
+st.subheader("מילוי נתוני חודש קודם (carry-forward)")
+carry_forward = st.checkbox(
+    "מלא אוטומטית ערכי כמות/מחיר מהחודש הקודם",
+    value=False,
+    help=(
+        "קורא את הערכים הקיימים בקובץ העובדים (Q8OVDM26) -- שמכיל את נתוני "
+        "החודש הקודם עד לייבוא החדש -- וממלא אותם מראש בגיליון. עובדים חדשים "
+        '(שלא היו בחודש הקודם) יקבלו שורה ריקה עם ת"ז ושם מסומנים בצהוב.'
+    ),
+)
+
+no_carry_numbers = set()
+if carry_forward:
+    mifl_path_cf = os.path.join(data_dir, f"Q8MIFL26.{company}")
+    try:
+        _cf_components, _ = engine.extract_components(mifl_path_cf)
+    except Exception as e:
+        st.error(f"Could not read components for carry-forward options: {e}")
+        _cf_components = []
+
+    if _cf_components:
+        default_nc = engine.default_no_carry_components(_cf_components)
+        st.caption(
+            "בחר רכיבים שלא יועברו מהחודש הקודם. כברירת מחדל מסומנים רכיבי "
+            "חופשה/מחלה/חג/לידה -- אפשר לשנות:"
+        )
+        # The carry-forward join key is the slot real number, which equals
+        # `actual` (= rechiv_extracted - 1), with the משכורת block = 1. Build
+        # the hidden _real column with that, so the no_carry set matches the
+        # keys read_prior_month() / build_excel() use.
+        nc_rows = pd.DataFrame(
+            {
+                "אל תעביר": [
+                    (1 if rc == 2 else rc - 1) in default_nc
+                    for rc, _n, _k in _cf_components
+                ],
+                "קוד": [(1 if rc == 2 else rc - 1) for rc, _n, _k in _cf_components],
+                "שם": [n for _rc, n, _k in _cf_components],
+                "_real": [(1 if rc == 2 else rc - 1) for rc, _n, _k in _cf_components],
+            }
+        )
+        nc_edited = st.data_editor(
+            nc_rows,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            disabled=["קוד", "שם", "_real"],
+            column_config={
+                "אל תעביר": st.column_config.CheckboxColumn(
+                    "אל תעביר", help="סמן רכיבים שלא יועברו מהחודש הקודם"
+                ),
+                "קוד": st.column_config.NumberColumn("קוד"),
+                "שם": st.column_config.TextColumn("שם"),
+                "_real": None,  # hidden helper column
+            },
+            key=f"nocarry_editor_{company}",
+        )
+        no_carry_numbers = {
+            int(row["_real"]) for _, row in nc_edited.iterrows() if row["אל תעביר"]
+        }
+        st.caption(f"לא יועברו {len(no_carry_numbers)} רכיבים.")
+
 if st.button("Extract & generate", type="primary"):
     mifl_path = os.path.join(data_dir, f"Q8MIFL26.{company}")
     ovdm_path = os.path.join(data_dir, f"Q8OVDM26.{company}")
     try:
         components, skipped = engine.extract_components(mifl_path)
-        employees, invalid = engine.extract_employees(ovdm_path)
+        active_emps, inactive_emps, _inv = load_employees_with_status(
+            ovdm_path, os.path.getmtime(ovdm_path)
+        )
     except Exception as e:
         st.error(f"Extraction failed: {e}")
     else:
+        # Decide which inactive employees to include, per the chosen mode.
+        if inactive_mode == ALL_INACTIVE:
+            included_inactive = list(inactive_emps)
+        elif inactive_mode == SELECT_INACTIVE:
+            chosen_set = set(selected_inactive)
+            included_inactive = [e for e in inactive_emps if e in chosen_set]
+        else:
+            included_inactive = []
+
+        employees = sorted(active_emps + included_inactive, key=lambda x: x[0])
+        invalid = sum(1 for tz, _name in employees if not tz)
+
         st.session_state.components = components
         st.session_state.skipped_components = skipped
         st.session_state.employees = employees
+        st.session_state.included_inactive = included_inactive
         st.session_state.invalid_employees = invalid
         st.session_state.extracted = True
         st.session_state.generated = False
@@ -145,9 +305,20 @@ if st.button("Extract & generate", type="primary"):
         template_text, col_map, stats_cols = engine.build_template(
             template_name, components
         )
+
+        # carry-forward: read previous month's values from the same Q8OVDM26
+        # (it holds last month's data until the new sheet is imported).
+        prior_month = None
+        if carry_forward:
+            try:
+                prior_month = engine.read_prior_month(ovdm_path)
+            except Exception as e:
+                st.error(f"Could not read previous month's values: {e}")
+                prior_month = None
+
         excel_path = os.path.join(out_dir, f"template_{company}.xlsx")
         try:
-            engine.build_excel(
+            cf_result = engine.build_excel(
                 company,
                 components,
                 col_map,
@@ -156,6 +327,8 @@ if st.button("Extract & generate", type="primary"):
                 excel_path,
                 int(year),
                 int(month),
+                prior_month=prior_month,
+                no_carry=no_carry_numbers,
             )
         except Exception as e:
             st.error(f"Excel generation failed: {e}")
@@ -164,17 +337,39 @@ if st.button("Extract & generate", type="primary"):
             st.session_state.col_map = col_map
             st.session_state.stats_cols = stats_cols
             st.session_state.excel_path = excel_path
+            st.session_state.carry_new_hires = cf_result["new_hires"]
+            st.session_state.carry_count = cf_result["carried"]
             st.session_state.generated = True
 
 if st.session_state.extracted:
     components = st.session_state.components
     employees = st.session_state.employees
 
-    m1, m2, m3, m4 = st.columns(4)
+    included_inactive = st.session_state.get("included_inactive", [])
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Components found", len(components))
     m2.metric("Components filtered out", st.session_state.skipped_components)
-    m3.metric("Employees found", len(employees))
-    m4.metric("Invalid תז blocks", st.session_state.invalid_employees)
+    m3.metric("Employees (total)", len(employees))
+    m4.metric("Inactive included", len(included_inactive))
+    m5.metric("Invalid תז blocks", st.session_state.invalid_employees)
+
+    if st.session_state.generated and st.session_state.carry_count:
+        new_hires = st.session_state.get("carry_new_hires", [])
+        cc1, cc2 = st.columns(2)
+        cc1.metric("Cells carried forward", st.session_state.carry_count)
+        cc2.metric("New hires (blank, yellow)", len(new_hires))
+        if new_hires:
+            with st.expander(
+                f"New hires — blank row, highlighted yellow ({len(new_hires)})"
+            ):
+                st.caption(
+                    "עובדים אלה לא היו בחודש הקודם, כך שאין מה למלא -- "
+                    'ת"ז ושם מסומנים בצהוב בגיליון.'
+                )
+                st.dataframe(
+                    [{"תעודת זהות": tz, "שם": name} for tz, name in new_hires],
+                    use_container_width=True,
+                )
 
     with st.expander(f"Component list ({len(components)})"):
         st.dataframe(
@@ -191,8 +386,16 @@ if st.session_state.extracted:
         )
 
     with st.expander(f"Employee list ({len(employees)})"):
+        inactive_set = set(st.session_state.get("included_inactive", []))
         st.dataframe(
-            [{"תעודת זהות": tz, "name": name} for tz, name in employees],
+            [
+                {
+                    "תעודת זהות": tz,
+                    "name": name,
+                    "סטטוס": "לא פעיל" if (tz, name) in inactive_set else "פעיל",
+                }
+                for tz, name in employees
+            ],
             use_container_width=True,
         )
 
