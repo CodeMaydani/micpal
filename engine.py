@@ -291,12 +291,34 @@ STATUS_UNUSED_SLOT = 2
 # actual + 1. build_excel()'s comp_to_cols relies on this to map a carried
 # component to its Excel columns; an earlier +1 here shifted every value one
 # component to the left (caught against company 004's real export).
+#
+# byte [9] is the per-component ברוטו/נטו flag (0xE1 -> ב ברוטו, 0xF0 -> נ נטו),
+# sitting in a fixed frame: byte [8] = 0xE3 (ד) const, byte [10] = 0x01 const,
+# byte [11] = 0x30 const. The flag is per (employee, component) and CAN differ
+# within one employee (company 004, זורבבל: comp 3=ב, 7=נ, 18=ב), so it is read
+# and carried per component into each component's own ב/נ column -- not a single
+# shared column. Decoded generically from the ISO-8859-8 Hebrew range so an
+# unforeseen flag (e.g. ג for גילום) passes through as its letter.
 SLOT_TABLE_OFFSET = 6303  # first component-line slot within an EMPLOYEE_BLOCK
 SLOT_SIZE = 22
 SLOT_COMP_NUM_OFF = 7  # within slot: component number (real מיכפל #), 1 byte
+SLOT_BN_OFF = 9  # within slot: ברוטו/נטו flag (0xE1=ב, 0xF0=נ), 1 byte
 SLOT_QTY_OFF = 14  # within slot: quantity x100, int32 LE
 SLOT_PRICE_OFF = 18  # within slot: price    x100, int32 LE
 _SLOT_WALK_GUARD = 260  # never walk past a plausible slot count (252 + margin)
+
+
+def _decode_bn(byte):
+    """Decode a salary slot's ברוטו/נטו flag byte (slot byte [9]) to a single
+    Hebrew character: ב (ברוטו) for 0xE1, נ (נטו) for 0xF0. Any non-Hebrew byte
+    (including 0x00) returns "" so the cell is left blank. Decoded from the
+    ISO-8859-8 Hebrew letter range rather than a fixed {ב,נ} map, so a flag we
+    have not seen yet (e.g. ג for גילום) surfaces as its letter instead of being
+    silently dropped."""
+    if 0xE0 <= byte <= 0xFA:  # ISO-8859-8 Hebrew letters א..ת
+        return bytes([byte]).decode("iso-8859-8")
+    return ""
+
 
 # Deduction values per employee (רכיבי ניכוי רשות). Stored in a SEPARATE,
 # tighter table than salary: packed 5-byte records in a "mirror" region at a
@@ -387,12 +409,14 @@ def read_prior_month(path):
 
     Returns a dict keyed by zero-padded תעודת זהות string:
 
-        { tz_str : { component_number (int) : (qty, price) } }
+        { tz_str : { component_number (int) : (qty, price, bn) } }
 
     qty and price are floats in whole-shekel units (the on-disk x100 agorot
-    scaling is undone here). component_number is the REAL מיכפל number from
-    slot byte [7], which equals col_map's `actual` (= rechiv_extracted - 1,
-    with the משכורת block = component 1) -- the key build_excel() joins on.
+    scaling is undone here); bn is the component's ברוטו/נטו flag as a single
+    character ("ב" ברוטו / "נ" נטו, or "" if the slot carries no flag), read
+    from slot byte [9]. component_number is the REAL מיכפל number from slot
+    byte [7], which equals col_map's `actual` (= rechiv_extracted - 1, with
+    the משכורת block = component 1) -- the key build_excel() joins on.
 
     Keyed by תז (not the raw int) so it joins directly against the employee
     rows build_excel() writes, which use the same zero-padded valid-תז
@@ -442,9 +466,10 @@ def read_prior_month(path):
 
 def _read_block_components(block):
     """
-    Parse one employee's block into {component_number: (qty, price)}.
+    Parse one employee's block into {component_number: (qty, price, bn)}.
     Walks the packed slot array from SLOT_TABLE_OFFSET, stopping at the
-    first all-zero slot. qty/price are floats in whole-shekel units.
+    first all-zero slot. qty/price are floats in whole-shekel units; bn is
+    the component's ברוטו/נטו flag as a single char ("ב"/"נ", or "" if none).
     """
     comps = {}
     for i in range(_SLOT_WALK_GUARD):
@@ -459,7 +484,8 @@ def _read_block_components(block):
             break  # terminator
         if comp == 0:
             continue  # value with no component number -- unmappable, skip
-        comps[comp] = (qty_raw / 100.0, price_raw / 100.0)
+        bn = _decode_bn(slot[SLOT_BN_OFF])
+        comps[comp] = (qty_raw / 100.0, price_raw / 100.0, bn)
     return comps
 
 
@@ -600,7 +626,7 @@ def build_template(template_name, components, deductions=None):
     Build the @@QD@@ text block for insertion into Q8SRGL26.000.
 
     Returns (template_text, col_map, stats_cols, ded_map).
-      col_map    -- list of (actual_code, name, col_כמות, col_מחיר)
+      col_map    -- list of (actual_code, name, col_כמות, col_מחיר, col_בנ)
       stats_cols -- list of (field_code, label, col_index)
       ded_map    -- list of (deduction_number, name, col_amount, col_month)
                     for each deduction (רכיבי ניכוי רשות); empty if none.
@@ -644,13 +670,17 @@ def build_template(template_name, components, deductions=None):
         if rechiv_extracted == 2:  # משכורת already covered in fixed block
             continue
         actual = rechiv_extracted - 1  # THE -1 OFFSET -- universally verified
-        col_k, col_m = col, col + 1
-        col_map.append((actual, name, col_k, col_m))
+        # Each non-משכורת component now occupies THREE columns: כמות, מחיר, and
+        # its own ברוטו/נטו. The flag is per-component in the file (Section 7),
+        # so field 8 points at this component's own column -- not the shared
+        # column C. (משכורת keeps C as its ב/נ via the fixed block above.)
+        col_k, col_m, col_bn = col, col + 1, col + 2
+        col_map.append((actual, name, col_k, col_m, col_bn))
         lines.append(f"@D{actual} -1 -1 1")
         lines.append(f"@D{actual} 5 {col_k} 1")
         lines.append(f"@D{actual} 6 {col_m} 1")
-        lines.append(f"@D{actual} 8 3 1")
-        col += 2
+        lines.append(f"@D{actual} 8 {col_bn} 1")  # ברוטו/נטו -> own column
+        col += 3
 
     # --- deductions (רכיבי ניכוי רשות): amount + month, after salary,
     #     before the stats block. Field codes 25=amount, 26=month; the @D
@@ -711,11 +741,12 @@ def build_excel(
 
     Carry-forward (optional):
       prior_month -- dict from read_prior_month(): {tz: {component_number:
-                     (qty, price)}}. When given, each employee's row is
+                     (qty, price, bn)}}. When given, each employee's row is
                      pre-filled with last month's qty/price for every
-                     component that maps to a column. Components are joined
-                     by REAL מיכפל number (= col_map `actual`, and the fixed
-                     משכורת block = component 1).
+                     component that maps to a column, plus that component's
+                     ברוטו/נטו flag (ב/נ) in its own column. Components are
+                     joined by REAL מיכפל number (= col_map `actual`, and the
+                     fixed משכורת block = component 1, whose ב/נ is column C).
       no_carry    -- iterable of REAL מיכפל component numbers NOT to carry
                      forward (e.g. vacation/sick). Defaults to none excluded.
 
@@ -813,9 +844,14 @@ def build_excel(
         fill=rechiv1_fill,
     )
 
-    for actual, name, col_k, col_m in col_map:
+    for actual, name, col_k, col_m, col_bn in col_map:
         style(safe_set(ws.cell(4, col_k), f"{name}\nכמות"), font=bold, fill=comp_fill)
         style(safe_set(ws.cell(4, col_m), f"{name}\nמחיר"), font=bold, fill=comp_fill)
+        style(
+            safe_set(ws.cell(4, col_bn), f"{name}\nברוטו/נטו"),
+            font=bold,
+            fill=comp_fill,
+        )
 
     # deduction headers: amount + month per deduction (after salary, before stats)
     for ded_number, name, col_amount, col_month in ded_map:
@@ -839,9 +875,9 @@ def build_excel(
     # NOTE: an earlier version used `actual + 1` here, derived from a synthetic
     # test that mismodeled the משכורת/רכב boundary; it shifted every carried
     # value one component to the left. Do not reintroduce the +1.
-    comp_to_cols = {1: (5, 6)}
-    for actual, name, col_k, col_m in col_map:
-        comp_to_cols[actual] = (col_k, col_m)
+    comp_to_cols = {1: (5, 6, 3)}  # משכורת: כמות E=5, מחיר F=6, ברוטו/נטו C=3
+    for actual, name, col_k, col_m, col_bn in col_map:
+        comp_to_cols[actual] = (col_k, col_m, col_bn)
 
     # deduction-number -> amount column (month column left for the operator)
     ded_to_col = {dn: col_amount for dn, _name, col_amount, _col_month in ded_map}
@@ -865,15 +901,17 @@ def build_excel(
             if not emp_prior:
                 no_activity.append((tz, full_name))
             else:
-                for comp_num, (qty, price) in emp_prior.items():
+                for comp_num, (qty, price, bn) in emp_prior.items():
                     if comp_num in no_carry:
                         continue
                     cols = comp_to_cols.get(comp_num)
                     if cols is None:
                         continue  # component has no column in this template
-                    col_k, col_m = cols
+                    col_k, col_m, col_bn = cols
                     style(safe_set(ws.cell(row_idx, col_k), qty), fill=emp_fill)
                     style(safe_set(ws.cell(row_idx, col_m), price), fill=emp_fill)
+                    if bn:
+                        style(safe_set(ws.cell(row_idx, col_bn), bn), fill=emp_fill)
                     carried += 1
         elif is_new_hire:
             new_hires.append((tz, full_name))
@@ -896,9 +934,10 @@ def build_excel(
     ws.column_dimensions["D"].width = 10
     ws.column_dimensions["E"].width = 10
     ws.column_dimensions["F"].width = 10
-    for actual, name, col_k, col_m in col_map:
+    for actual, name, col_k, col_m, col_bn in col_map:
         ws.column_dimensions[col_letter(col_k)].width = 10
         ws.column_dimensions[col_letter(col_m)].width = 10
+        ws.column_dimensions[col_letter(col_bn)].width = 9
     for ded_number, name, col_amount, col_month in ded_map:
         ws.column_dimensions[col_letter(col_amount)].width = 11
         ws.column_dimensions[col_letter(col_month)].width = 8

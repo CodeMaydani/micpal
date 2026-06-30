@@ -715,15 +715,17 @@ if st.session_state.extracted:
                     "name": first_comp_name,
                     "col כמות": "E",
                     "col מחיר": "F",
+                    "col ברוטו/נטו": "C",
                 }
             ]
-            for actual, name, ck, cm in st.session_state.col_map:
+            for actual, name, ck, cm, cbn in st.session_state.col_map:
                 rows.append(
                     {
                         "actual code": actual,
                         "name": name,
                         "col כמות": engine.col_letter(ck),
                         "col מחיר": engine.col_letter(cm),
+                        "col ברוטו/נטו": engine.col_letter(cbn),
                     }
                 )
             st.dataframe(rows, use_container_width=True)
